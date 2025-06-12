@@ -569,11 +569,6 @@ class Model:
             # needs to be added into the graph or not.
             return
 
-        # Save any constants as nodes
-        for input_name in inputs:
-            if input_name.startswith("/model/constants") and input_name not in self.node_names:
-                self.make_constant(input_name)
-
         # Resolve values from names
         input_values = [self.make_value_info(name) for name in inputs]
         output_values = [self.make_value_info(name) for name in outputs]
@@ -630,24 +625,14 @@ class Model:
             value_name = f"present.{i}.value"
             outputs.append(self.make_value_info(value_name, dtype=self.output_types["present.value"], shape=self.output_shapes["present.value"]))
 
-    def make_constant(self, name):
+    def make_constant(self, value, dtype: ir.DataType):
         # Make constant ops for 0, 1, 2, 3, etc.
         # Format of name is "/model/constants/{dtype}/{shape}/{num}"
-
-        path = name.split("/")
-        onnx_dtype = ir.DataType[path[-3]]
-        dims = path[-2]
-        # NOTE: Use ast.literal_eval instead of eval as eval allows arbitrary code execution
-        num = ast.literal_eval(path[-1])
-        assert dims in {"0D", "1D"}, f"Unexpected dimension {dims} in constant name"
-        if not(dims == "0D"):
-            # Convert to 1D tensor
-            num = [num]
-        tensor = ir.tensor(num, dtype=onnx_dtype, name=name)
-
+        tensor = ir.tensor(value, dtype=dtype)
+        name = f"/model/constants/{self.to_str_dtype(dtype)}/{tensor.shape.numpy()}/{value}"
         node_name = name.replace("constants", "constant_nodes")
         self.make_node("Constant", inputs=[], outputs=[name], name=node_name, value=tensor)
-        self.make_value_info(name, onnx_dtype, shape=[])
+        self.make_value_info(name, dtype, shape=tensor.shape)
 
     def make_gather(self, name, inputs, axis):
         output = f"{name}/output_0"
@@ -738,7 +723,7 @@ class Model:
         output = f"{name}/output_0"
         if self.quant_attrs["use_qdq"]:
             # Opset 18 uses axes as input[1]
-            inputs.append(f"/model/constants/INT64/1D/{','.join(map(str, axes))}")
+            inputs.append(self.make_constant(axes, ir.DataType.INT64))
             self.make_node("ReduceMean", inputs=inputs, outputs=[output], name=name, keepdims=keepdims)
             self.make_value_info(output, dtype, shape=shape)
         else:
@@ -1056,7 +1041,7 @@ class Model:
         if self.embed_attrs["scale"] != 1:
             # Scale the embeddings
             mul_name = f"{basename}/Mul"
-            mul_inputs = [gather_output, f"/model/constants/{self.to_str_dtype(self.io_dtype)}/0D/{self.embed_attrs['scale']}"]
+            mul_inputs = [gather_output, self.make_constant(self.embed_attrs['scale'], self.io_dtype)]
             mul_output = f"{mul_name}/output_0"
             self.make_node('Mul', inputs=mul_inputs, outputs=[mul_output], name=mul_name)
             self.make_value_info(mul_output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
@@ -1396,7 +1381,7 @@ class Model:
             gather_name = "/model/attn_mask_reformat/attn_mask_subgraph/Gather_2"
 
         greater_name = f"{basename}/Greater"
-        greater_inputs = [f"{gather_name}/output_0", f"/model/constants/INT64/0D/{self.original_context_length}"]
+        greater_inputs = [f"{gather_name}/output_0", self.make_constant(self.original_context_length, ir.DataType.INT64)]
         self.make_greater(greater_name, greater_inputs, shape=[])
         if_name = f"{basename}/If"
 
@@ -1517,33 +1502,33 @@ class Model:
         #                            Mul_1
 
         make_cast_name = f"{basename}/Cast"
-        self.make_cast(make_cast_name, root_input, TensorProto.FLOAT, shape=shape)
+        self.make_cast(make_cast_name, root_input, ir.DataType.FLOAT, shape=shape)
 
         make_pow_name = f"{basename}/Pow"
-        make_pow_inputs = [f"{make_cast_name}/output_0", f"/model/constants/FLOAT/0D/2"]
+        make_pow_inputs = [f"{make_cast_name}/output_0", self.make_constant(2.0, ir.DataType.FLOAT)]
 
         self.make_node("Pow", inputs=make_pow_inputs, outputs=[f"{make_pow_name}/output_0"], name=make_pow_name, domain="")
-        self.make_value_info(f"{make_pow_name}/output_0", TensorProto.FLOAT, shape=shape)
+        self.make_value_info(f"{make_pow_name}/output_0", ir.DataType.FLOAT, shape=shape)
 
         make_reducemean_name = f"{basename}/ReduceMean"
         make_reducemean_inputs = [f"{make_pow_name}/output_0"]
-        self.make_reduce_mean(make_reducemean_name, make_reducemean_inputs, TensorProto.FLOAT, keepdims=True, axes=[-1], shape=shape)
+        self.make_reduce_mean(make_reducemean_name, make_reducemean_inputs, ir.DataType.FLOAT, keepdims=True, axes=[-1], shape=shape)
 
         make_add_name = f"{basename}/Add"
-        make_add_inputs = [f"{make_reducemean_name}/output_0", f"/model/constants/FLOAT/0D/{self.layernorm_attrs['epsilon']}"]
-        self.make_add(make_add_name, make_add_inputs, TensorProto.FLOAT, shape=shape)
+        make_add_inputs = [f"{make_reducemean_name}/output_0", self.make_constant(self.layernorm_attrs['epsilon'], ir.DataType.FLOAT)]
+        self.make_add(make_add_name, make_add_inputs, ir.DataType.FLOAT, shape=shape)
 
         make_sqrt_name = f"{basename}/Sqrt"
         make_sqrt_inputs = [f"{make_add_name}/output_0"]
-        self.make_sqrt(make_sqrt_name, make_sqrt_inputs, TensorProto.FLOAT, shape=shape)
+        self.make_sqrt(make_sqrt_name, make_sqrt_inputs, ir.DataType.FLOAT, shape=shape)
 
         make_div_name = f"{basename}/Div"
-        make_div_inputs = [f"/model/constants/FLOAT/0D/1", f"{make_sqrt_name}/output_0"]
-        self.make_div(make_div_name, make_div_inputs, TensorProto.FLOAT, shape=shape)
+        make_div_inputs = [self.make_constant(1.0, ir.DataType.FLOAT), f"{make_sqrt_name}/output_0"]
+        self.make_div(make_div_name, make_div_inputs, ir.DataType.FLOAT, shape=shape)
 
         make_mul_name = f"{basename}/Mul"
         make_mul_inputs = [f"{make_div_name}/output_0", f"{make_cast_name}/output_0"]
-        self.make_mul(make_mul_name, make_mul_inputs, TensorProto.FLOAT, shape=shape)
+        self.make_mul(make_mul_name, make_mul_inputs, ir.DataType.FLOAT, shape=shape)
 
         make_cast_1_name = f"{basename}/Cast_1"
         self.make_cast(make_cast_1_name, f"{make_mul_name}/output_0", dtype=io_dtype, shape=shape)
@@ -1725,7 +1710,7 @@ class Model:
         shape_1_name = f"{basename}/Shape_1"
         self.make_shape(shape_1_name, present_kv, shape=[4])
         gather_1_name = f"{basename}/Gather_1"
-        gather_1_inputs = [f"{shape_1_name}/output_0", "/model/constants/INT64/0D/0"]
+        gather_1_inputs = [f"{shape_1_name}/output_0", self.make_constant(0, ir.DataType.INT64)]
         self.make_gather(gather_1_name, gather_1_inputs, axis=0)
         unsqueeze_1_name = f"{basename}/Unsqueeze_1"
         unsqueeze_1_inputs = [f"{gather_1_name}/output_0", "/model/constants/INT64/1D/0"]
@@ -1767,7 +1752,7 @@ class Model:
         #    |                                        |
         #    +----------------------------------------+
         reshape_2_name = f"{basename}/Reshape_2"
-        reshape_2_inputs = [f"{concat_2_name}/output_0", "/model/constants/INT64/1D/-1"]
+        reshape_2_inputs = [f"{concat_2_name}/output_0", self.make_constant([-1], ir.DataType.INT64)]
         self.make_reshape(reshape_2_name, reshape_2_inputs, dtype=ir.DataType.INT64, shape=None)
         shape_2_name = f"{basename}/Shape_2"
         self.make_shape(shape_2_name, f"{reshape_2_name}/output_0", shape=[1])
@@ -1790,7 +1775,7 @@ class Model:
         #                   \           \
         # Unsqueeze --> Expand --> Reshape --> Transpose --> Reshape
         unsqueeze_5_name = f"{basename}/Unsqueeze_5"
-        unsqueeze_5_inputs = [present_kv, "/model/constants/INT64/1D/2"]
+        unsqueeze_5_inputs = [present_kv, self.make_constant([2], ir.DataType.INT64)]
         self.make_unsqueeze(unsqueeze_5_name, unsqueeze_5_inputs, dtype=self.io_dtype, shape=['batch_size', self.num_kv_heads, 1, 'sequence_length', self.head_size])
         expand_name = f"{basename}/Expand"
         expand_inputs = [f"{unsqueeze_5_name}/output_0", f"{where_name}/output_0"]
@@ -2294,7 +2279,7 @@ class Model:
         unsqueeze_name = f"{gate_ops_base}/Unsqueeze"
         self.make_unsqueeze(unsqueeze_name, [f"{gather_name}/output_0", "/model/constants/INT64/1D/0"], dtype=ir.DataType.INT64, shape=[1])
         concat_name = f"{gate_ops_base}/Concat"
-        self.make_concat(concat_name, ["/model/constants/INT64/1D/-1", f"{unsqueeze_name}/output_0"], dtype=ir.DataType.INT64, shape=[2], axis=0)
+        self.make_concat(concat_name, [self.make_constant([-1], ir.DataType.INT64), f"{unsqueeze_name}/output_0"], dtype=ir.DataType.INT64, shape=[2], axis=0)
         gate_reshape_name = f"{gate_ops_base}/Reshape"
         self.make_reshape(gate_reshape_name, [f"{gate_name}/output_0", f"{concat_name}/output_0"], dtype=self.io_dtype, shape=['num_rows', num_experts])
 
@@ -2809,7 +2794,7 @@ class Model:
         shape_4_name = f"{basename}/Shape_4"
         self.make_shape(shape_4_name, f"{constant_shape_name}/output_0", shape=[2])
         slice_1_name = f"{basename}/Slice_1"
-        slice_1_inputs = [f"{shape_4_name}/output_0", "/model/constants/INT64/1D/-1", f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", "/model/constants/INT64/1D/0"]
+        slice_1_inputs = [f"{shape_4_name}/output_0", self.make_constant([-1], ir.DataType.INT64), f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", "/model/constants/INT64/1D/0"]
         self.make_slice(slice_1_name, slice_1_inputs, dtype=ir.DataType.INT64, shape=[1])
         squeeze_1_name = f"{basename}/Squeeze_1"
         squeeze_1_inputs = [f"{slice_1_name}/output_0", "/model/constants/INT64/1D/0"]
@@ -2825,13 +2810,13 @@ class Model:
         shape_5_name = f"{basename}/Shape_5"
         self.make_shape(shape_5_name, f"{constant_shape_name}/output_0", shape=[2])
         slice_2_name = f"{basename}/Slice_2"
-        slice_2_inputs = [f"{shape_5_name}/output_0", "/model/constants/INT64/1D/-1", f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", "/model/constants/INT64/1D/0"]
+        slice_2_inputs = [f"{shape_5_name}/output_0", self.make_constant([-1], ir.DataType.INT64), f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", "/model/constants/INT64/1D/0"]
         self.make_slice(slice_2_name, slice_2_inputs, dtype=ir.DataType.INT64, shape=[1])
         squeeze_2_name = f"{basename}/Squeeze_2"
         squeeze_2_inputs = [f"{slice_2_name}/output_0", "/model/constants/INT64/1D/0"]
         self.make_squeeze(squeeze_2_name, squeeze_2_inputs)
         range_name = f"{basename}/Range"
-        range_inputs = ["/model/constants/INT64/0D/0", f"{squeeze_2_name}/output_0", "/model/constants/INT64/0D/1"]
+        range_inputs = [self.make_constant(0, ir.DataType.INT64), f"{squeeze_2_name}/output_0", "/model/constants/INT64/0D/1"]
         self.make_range(range_name, range_inputs)
         add_2_name = f"{basename}/Add_2"
         add_inputs = [f"{range_name}/output_0", "/model/constants/INT64/0D/1"]
@@ -2867,7 +2852,7 @@ class Model:
         attention_mask_shape.insert(1, 1) # ['batch_size', 'total_sequence_length'] --> ['batch_size', 1, 'total_sequence_length']
         self.make_unsqueeze(unsqueeze_3_name, unsqueeze_3_inputs, dtype=ir.DataType.INT64, shape=attention_mask_shape)
         unsqueeze_4_name = f"{basename}/Unsqueeze_4"
-        unsqueeze_4_inputs = [f"{unsqueeze_3_name}/output_0", "/model/constants/INT64/1D/2"]
+        unsqueeze_4_inputs = [f"{unsqueeze_3_name}/output_0", self.make_constant([2], ir.DataType.INT64)]
         attention_mask_shape.insert(1, 1) # ['batch_size', 1, 'total_sequence_length'] --> ['batch_size', 1, 1, 'total_sequence_length']
         self.make_unsqueeze(unsqueeze_4_name, unsqueeze_4_inputs, dtype=ir.DataType.INT64, shape=attention_mask_shape)
 
@@ -2933,7 +2918,7 @@ class Model:
         shape_2_name = f"{basename}/Shape_2"
         self.make_shape(shape_2_name, root_input, shape=[3] if self.exclude_embeds and input_ids_subgraph else [2])
         gather_1_name = f"{basename}/Gather_1"
-        gather_1_inputs = [f"{shape_1_name}/output_0", "/model/constants/INT64/0D/0"]
+        gather_1_inputs = [f"{shape_1_name}/output_0", self.make_constant(0, ir.DataType.INT64)]
         self.make_gather(gather_1_name, gather_1_inputs, axis=0)
         gather_2_name = f"{basename}/Gather_2"
         gather_2_inputs = [f"{shape_2_name}/output_0", "/model/constants/INT64/0D/1"]
@@ -3416,7 +3401,7 @@ class Phi3SmallModel(Model):
 
         # Left path
         slice_1_name = f"/model/layers.{layer_id}/mlp/gelu/Slice"
-        slice_1_inputs = [f"{up_add_name}/output_0", "/model/constants/INT64/1D/0", f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", "/model/constants/INT64/1D/-1", "/model/constants/INT64/1D/2"]
+        slice_1_inputs = [f"{up_add_name}/output_0", "/model/constants/INT64/1D/0", f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", self.make_constant([-1], ir.DataType.INT64), self.make_constant([2], ir.DataType.INT64)]
         self.make_slice(slice_1_name, slice_1_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
         cast_1_name = f"/model/layers.{layer_id}/mlp/gelu/Cast"
         self.make_cast(cast_1_name, f"{slice_1_name}/output_0", dtype=ir.DataType.FLOAT, shape=["batch_size", "sequence_length", self.intermediate_size])
@@ -3433,7 +3418,7 @@ class Phi3SmallModel(Model):
 
         # Right path
         slice_2_name = f"/model/layers.{layer_id}/mlp/linear/Slice"
-        slice_2_inputs = [f"{up_add_name}/output_0", "/model/constants/INT64/1D/1", f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", "/model/constants/INT64/1D/-1", "/model/constants/INT64/1D/2"]
+        slice_2_inputs = [f"{up_add_name}/output_0", "/model/constants/INT64/1D/1", f"/model/constants/INT64/1D/{torch.iinfo(torch.int64).max}", self.make_constant([-1], ir.DataType.INT64), self.make_constant([2], ir.DataType.INT64)]
         self.make_slice(slice_2_name, slice_2_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
         cast_2_name = f"/model/layers.{layer_id}/mlp/linear/Cast"
         self.make_cast(cast_2_name, f"{slice_2_name}/output_0", dtype=ir.DataType.FLOAT, shape=["batch_size", "sequence_length", self.intermediate_size])
