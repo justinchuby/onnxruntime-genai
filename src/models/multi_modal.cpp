@@ -111,14 +111,15 @@ MultiModalLanguageModel::MultiModalLanguageModel(std::unique_ptr<Config> config,
 
   embedding_session_ = CreateSession(ort_env, config_->model.embedding.filename, embedding_session_options_.get());
 
-  // Disable memory pattern for the decoder session. With CUDA EP, ORT inserts
-  // InsertedPrecisionFreeCast nodes (FP16→FP32). Memory pattern pre-allocates
-  // these nodes' output buffers based on the first run's shape. In multimodal
-  // pipelines, inputs_embeds shape changes between prefill (seq_len=N) and
-  // generation (seq_len=1), causing a shape mismatch crash. Disabling memory
-  // pattern allows ORT to re-allocate buffers for each run.
-  // NOTE: This only affects the multimodal decoder, not text-only models.
-  session_options_->DisableMemPattern();
+  // Disable memory pattern for the decoder session when the config doesn't
+  // explicitly set it. With CUDA EP, ORT's memory pattern pre-allocates
+  // buffers based on the first run's shape. In multimodal pipelines,
+  // inputs_embeds shape changes between prefill (seq_len=N) and generation
+  // (seq_len=1), causing a shape mismatch crash. Only force-disable when
+  // the config hasn't already specified a preference.
+  if (!config_->model.decoder.session_options.enable_mem_pattern.has_value()) {
+    session_options_->DisableMemPattern();
+  }
   decoder_session_ = CreateSession(ort_env, config_->model.decoder.filename, session_options_.get());
 
   session_info_.Add(*decoder_session_);
@@ -789,6 +790,8 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
       }
     }
     if (speech_state_ && num_audio_tokens_ > 0) {
+      // Speech model outputs 3D [batch, num_tokens, hidden_size]; reshape to
+      // 2D [batch * num_tokens, hidden_size] for the embedding model input.
       auto& speech_shape = speech_state_->audio_features_->GetShape();
       if (speech_shape.size() == 3) {
         speech_state_->audio_features_->ReshapeFeatures(
@@ -807,8 +810,8 @@ DeviceSpan<float> MultiModalPipelineState::Run(int current_length, DeviceSpan<in
     auto logits = decoder_state_->Run(current_length, next_tokens, next_indices);
 
     is_prompt_ = false;
-    if (vision_state_) vision_state_.reset();
-    if (speech_state_) speech_state_.reset();
+    if (vision_state_) vision_state_.reset();  // Vision state no longer needed after prompt
+    if (speech_state_) speech_state_.reset();  // Speech state no longer needed after prompt
 
     return logits;
   }
