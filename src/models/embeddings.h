@@ -23,9 +23,6 @@ struct Embeddings {
 
   void ReuseEmbeddingsBuffer(const Embeddings& other);
 
-  // Copy the output of this Embeddings to the input of another.
-  void CopyOutputToInput(Embeddings& destination) const;
-
   // Clear the output slot so ORT allocates fresh on next Run.
   // Prevents stale OrtValues from persisting across runs.
   void ClearOutput() {

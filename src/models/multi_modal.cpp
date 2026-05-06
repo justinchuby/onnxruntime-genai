@@ -117,10 +117,8 @@ MultiModalLanguageModel::MultiModalLanguageModel(std::unique_ptr<Config> config,
   // pipelines, inputs_embeds shape changes between prefill (seq_len=N) and
   // generation (seq_len=1), causing a shape mismatch crash. Disabling memory
   // pattern allows ORT to re-allocate buffers for each run.
-  // Disable memory pattern for dynamic shapes in multimodal decoder
+  // NOTE: This only affects the multimodal decoder, not text-only models.
   session_options_->DisableMemPattern();
-  // Also add session config entry to ensure mem pattern is disabled
-  session_options_->AddConfigEntry("session.disable_mem_pattern", "1");
   decoder_session_ = CreateSession(ort_env, config_->model.decoder.filename, session_options_.get());
 
   session_info_.Add(*decoder_session_);
